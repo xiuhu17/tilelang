@@ -54,19 +54,19 @@ def eager_attn_fwd(q, k, v, attn_bias, sinks, scale, dropout):
 
 
 @torch.no_grad
-def eager_attn_bwd(q, kv, attn_bias, sinks, scale, dropout, attn_output, probs, grad_output):
+def eager_attn_bwd(q, kv, attn_bias, sinks, scale, dim_short, dropout, attn_output, probs, grad_output):
     """Backward pass for eager attention"""
 
     # Rearrange query, key, value to (b, h, s, d)
     b, sq, h, d = q.shape
-    sk = kv.shape[1]
+    _, sk, _, _ = kv.shape
     k = kv
-    v = kv[:,:,:,:512]
-    q_tail = q[:,:,:,512:]
+    v = kv[:,:,:,:dim_short]
+    q_tail = q[:,:,:,dim_short:]
     _q_tail_T = einops.rearrange(q_tail, 'b s h d -> b h d s').contiguous()
     _q_T = einops.rearrange(q, 'b s h d -> b h d s')
     _k_T = einops.rearrange(k, 'b s h d -> b h s d')
-    _v_T = einops.rearrange(v, ' b s h d -> b h d s')
+    _v_T = einops.rearrange(v, 'b s h d -> b h d s')
 
     # Backward pass for score @ value
     if sinks is None:
@@ -76,7 +76,7 @@ def eager_attn_bwd(q, kv, attn_bias, sinks, scale, dropout, attn_output, probs, 
     grad_output = einops.rearrange(grad_output, 'b s h d -> b h s d')
     attn_w_T = einops.rearrange(attn_w, ' b h sq sk -> b h sk sq')
     grad__v = torch.matmul(attn_w_T, grad_output).contiguous() # b h sk d
-    grad_attn_w = torch.matmul(grad_output, _v_T).contiguous() # b h s sk
+    grad_attn_w = torch.matmul(grad_output, _v_T).contiguous() # b h s d  || b h d sk -> b h s sk
  
     # Backward pass for softmax
     if sinks is None:
@@ -105,8 +105,8 @@ def eager_attn_bwd(q, kv, attn_bias, sinks, scale, dropout, attn_output, probs, 
 
     grad__k_T = grad__k.transpose(2, 3).contiguous() # b h sk d
     grad__kv = torch.zeros((b, h, sk, 576), device=q.device, dtype=q.dtype) # b h sk d
-    grad__kv[:,:,:,:512] = grad__v + grad__k_T[:,:,:,:512]
-    grad__kv[:,:,:,512:] = torch.matmul(_q_tail_T, grad_attn_w).contiguous().transpose(2, 3).contiguous() # b h sk d
+    grad__kv[:,:,:,:dim_short] = grad__v + grad__k_T[:,:,:,:dim_short]
+    grad__kv[:,:,:,dim_short:] = torch.matmul(_q_tail_T, grad_attn_w).contiguous().transpose(2, 3).contiguous() # b h sk d
 
     # Rearrange grads to (b, s, h, d)
     grad__kv = grad__kv.transpose(1, 2).contiguous()
@@ -245,6 +245,8 @@ class Ref(torch.autograd.Function):
         ctx.scale = softmax_scale
         ctx.heads_k_stride = heads_k_stride  # TODO make it configurable
         ctx.pg = pg
+        ctx.dim = q.shape[3]
+        ctx.dim_short = v.shape[3]
 
         return out
 
@@ -254,6 +256,8 @@ class Ref(torch.autograd.Function):
 
         # Initialize or resume constants and communication group
         q, kv, _, attention_mask, *rest = ctx.saved_tensors
+        dim = ctx.dim
+        dim_short = ctx.dim_short
         nheads = q.shape[2]
         nheads_kv = kv.shape[2]
         heads_kv_stride = ctx.heads_k_stride
@@ -313,7 +317,7 @@ class Ref(torch.autograd.Function):
 
             # Backward pass
             dq_i, _dkv_i, _ = eager_attn_bwd(
-                q_i, kv_i, attn_bias, None, ctx.scale, ctx.dropout, outs[i], probs[i], dout_i
+                q_i, kv_i, attn_bias, None, ctx.scale, dim_short, ctx.dropout, outs[i], probs[i], dout_i
             )
 
             # Rearrange gradients to (s, b, h, d)
@@ -338,4 +342,4 @@ class Ref(torch.autograd.Function):
         # Concatenate gradients and return
         dq = torch.cat(dq, dim=2)
         dkv = torch.cat(dkv, dim=2)
-        return dq, dkv, dkv[:,:,:,:512].contiguous(), None, None, None, None, None
+        return dq, dkv, dkv[:,:,:,:dim_short].detach().contiguous(), None, None, None, None, None
