@@ -148,15 +148,12 @@ def test_kernel(
 
     # [b, 1, sq, skv_global]
     q_local.grad = None
-    k_local.grad = None
-    v_local.grad = None
     kv_local.grad = None
-    res1 = Ref.apply(q_local, k_local, v_local, sparse_mask_local, attention_dropout, sm_scale, cp_pg, True)
+    res1 = Ref.apply(q_local, kv_local, v_local, sparse_mask_local, attention_dropout, sm_scale, cp_pg, True)
     res1.backward(do)
     dq_ref = q_local.grad
-    if dist.get_rank() == 0:
-        print(k_local.grad[0][0][3])
-        print(v_local.grad[0][0][3])
+    dkv_ref = kv_local.grad
+
     # [batch, kv_group, seq_len, topk]
     q_local.grad = None
     k_local.grad = None
@@ -165,11 +162,12 @@ def test_kernel(
     res2 = AttentionFuncionWithContextParallel.apply(q_local, kv_local, indices_local, topk, attention_dropout, sm_scale, cp_pg)
     res2.backward(do)
     dq = q_local.grad
-    if dist.get_rank() == 0:
-        print(kv_local.grad[0][0][3])
+    dkv = kv_local.grad
 
     # match the dq
     assert torch.allclose(dq_ref, dq, rtol=1e-1, atol=1e-1)
+    assert torch.allclose(dkv_ref, dkv, rtol=1e-1, atol=1e-1)
+
 
 # run this test: rm -rf /tmp/tilelang_cache_clean && CUDA_VISIBLE_DEVICES=4,5,6,7 TILELANG_CACHE_DIR=/tmp/tilelang_cache_clean torchrun --nproc_per_node=4 /root/tilelang/examples/deepseek_v32/test.py
 test_kernel(32, 512, 512, 512, 64, 128, 128, 128, 4)

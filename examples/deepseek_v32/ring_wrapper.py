@@ -199,7 +199,7 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
             # Backward pass
             # TODO: needs casual = True, may not be compatible with zz
             dq_i, _dkv_i = sparse_mla_bwd(q_i.contiguous(), kv_i.contiguous(), outs[i], dout_i.contiguous(), zz_indices_i, lses[i], softmax_scale, True)
-
+            
             # Rearrange gradients to (s, b, h, d)
             dq_i = einops.rearrange(dq_i, 'b s h d -> s b h d')
             _dkv_i = einops.rearrange(_dkv_i, 'b s h d -> s b h d')
