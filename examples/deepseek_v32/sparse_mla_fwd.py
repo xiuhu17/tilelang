@@ -105,7 +105,6 @@ def sparse_mla_fwd(
             b_i, g_i = by, bz
             s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
             q_i = s_i
-            max_kv_i = q_i
 
             H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
             H1 = H0 + H_per_block
@@ -114,16 +113,12 @@ def sparse_mla_fwd(
             T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
 
             for i_i in T.Pipelined(NI, num_stages=num_stages):
-                for bi_i in T.Parallel(BI):
-                    mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] <= max_kv_i
-
                 for bi_i, d_i in T.Parallel(BI, D):
                     KV_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i]
                 for bi_i, d_i in T.Parallel(BI, D_tail):
                     K_tail_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i]
-
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
-                    acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_s.dtype))
+                    acc_s[h_i, bi_i] = 0
                 T.gemm(
                     Q_shared,
                     KV_shared,
@@ -214,6 +209,38 @@ def ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, is_casual=True):
     mask = q.new_zeros(b, g_index, sq, sk + 1, dtype=torch.bool).scatter(3, indices.long(), 1)
     mask = mask[..., :-1]
     mask = mask & compressed_casual_mask.view(1, 1, sq, sk)
+    mask[:, :, : 1 - 1, 0] = True
+    mask = mask.view(b, g_index, 1, sq, sk)
+
+    q = q.view(b, sq, g, -1, dim_q)
+    score = torch.einsum("bmghd,bngd->bghmn", q, k)
+    sm_scale = dim_q**-0.5 if sm_scale is None else sm_scale
+    score = score.masked_fill(~mask, float("-inf")).mul(sm_scale)
+    p = score.softmax(dim=-1)
+    p = p.view(b, g_index, h_index, -1, sq, sk)
+    p = p.view(b, g, -1, sq, sk)
+    o = torch.einsum("bghmn,bngd->bmghd", p.type(v.dtype), v)
+    o = o.reshape(b, sq, h, dim_v)
+    return o.to(torch.bfloat16)
+
+def ref_sparse_mla_fwd_interface_no_mask(q, kv, indices, sm_scale=None, is_casual=True):
+    q = q.float()
+    kv = kv.float()
+    indices = indices.transpose(1, 2)
+    b, sq, h, dim_q = q.shape
+    b, sk, g, _ = kv.shape
+
+    assert kv.shape[-1] == 576, "you should assign dim otherwise"
+    dim = 512
+    k = kv
+    v = kv[..., :dim]
+
+    b, _, _, dim_v = v.shape
+    g_index = g
+    h_index = h // g
+    
+    mask = q.new_zeros(b, g_index, sq, sk + 1, dtype=torch.bool).scatter(3, indices.long(), 1)
+    mask = mask[..., :-1]
     mask[:, :, : 1 - 1, 0] = True
     mask = mask.view(b, g_index, 1, sq, sk)
 

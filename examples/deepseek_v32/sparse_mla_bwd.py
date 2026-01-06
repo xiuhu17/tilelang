@@ -94,7 +94,7 @@ def bwd(
     is_causal=True,
     block_size=32,
     num_stages=0,
-    threads=256,
+    threads=128,
     indices_dtype=T.int32,
     dtype=T.bfloat16,
     accum_dtype=T.float32,
@@ -147,7 +147,6 @@ def bwd(
             KV_shared = T.alloc_shared([BS, D], dtype)
             KV_tail_shared = T.alloc_shared([BS, D_tail], dtype)
             dO_shared = T.alloc_shared([block_H, D], dtype)
-            mask = T.alloc_fragment([BS], "bool")
 
             P_shared_cast = T.alloc_shared([block_H, BS], dtype)
             dP_shared_cast = T.alloc_shared([block_H, BS], dtype)
@@ -174,13 +173,9 @@ def bwd(
 
             # Process each block of indices
             for i_i in T.Pipelined(NS, num_stages=num_stages):
-                # Check which indices are valid
-                for bi_i in T.Parallel(BS):
-                    mask[bi_i] = Indices[by, s_i, bz // NH, i_i * BS + bi_i] <= max_kv_i
-
                 # Compute attention scores
                 for h_i, bi_i in T.Parallel(block_H, BS):
-                    acc_p[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_p.dtype))
+                    acc_p[h_i, bi_i] = 0
 
                 # Load KV, V for this block of indices
                 for bi_i, d_i in T.Parallel(BS, D):

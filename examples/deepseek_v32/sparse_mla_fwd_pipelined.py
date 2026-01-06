@@ -310,7 +310,9 @@ def sparse_mla_fwd(
 def sparse_mla_fwd_interface(
     q, kv, indices, q_start_index_s, kv_stride, sm_scale=None, is_casual=True, return_kernel=False, print_kernel=False
 ):
-    assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous()
+    assert q.is_contiguous()
+    assert kv.is_contiguous() 
+    assert indices.is_contiguous()
     batch, seq_len, heads, dim_plus_tail_dim = q.shape
     _, seq_len_kv, kv_group, _ = kv.shape
 
