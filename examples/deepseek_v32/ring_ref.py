@@ -338,4 +338,4 @@ class Ref(torch.autograd.Function):
         # Concatenate gradients and return
         dq = torch.cat(dq, dim=2)
         dkv = torch.cat(dkv, dim=2)
-        return dq, dkv, None, None, None, None, None, None
+        return dq, dkv, dkv[:,:,:,:512].contiguous(), None, None, None, None, None
