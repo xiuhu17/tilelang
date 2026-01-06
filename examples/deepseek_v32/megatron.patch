@@ -1,5 +1,5 @@
 diff --git a/megatron/core/transformer/dot_product_attention_context_parallel.py b/megatron/core/transformer/dot_product_attention_context_parallel.py
-index 89659a1d7..160e58f2c 100644
+index 89659a1d7..77f1beb87 100644
 --- a/megatron/core/transformer/dot_product_attention_context_parallel.py
 +++ b/megatron/core/transformer/dot_product_attention_context_parallel.py
 @@ -6,6 +6,7 @@
@@ -56,7 +56,7 @@ index 89659a1d7..160e58f2c 100644
 +    grad__k = torch.matmul(_q_T, grad_attn_w).contiguous() # b h d sk
 +
 +    grad__k_T = grad__k.transpose(2, 3).contiguous() # b h sk d
-+    grad__kv = torch.zeros((b, h, sk, 576), device=q.device, dtype=q.dtype) # b h sk d
++    grad__kv = torch.zeros((b, h, sk, d), device=q.device, dtype=q.dtype) # b h sk d
 +    grad__kv[:,:,:,:dim_short] = grad__v + grad__k_T[:,:,:,:dim_short]
 +    grad__kv[:,:,:,dim_short:] = torch.matmul(_q_tail_T, grad_attn_w).contiguous().transpose(2, 3).contiguous() # b h sk d
  

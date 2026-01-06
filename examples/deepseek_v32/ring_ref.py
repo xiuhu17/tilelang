@@ -104,7 +104,7 @@ def eager_attn_bwd(q, kv, attn_bias, sinks, scale, dim_short, dropout, attn_outp
     grad__k = torch.matmul(_q_T, grad_attn_w).contiguous() # b h d sk
 
     grad__k_T = grad__k.transpose(2, 3).contiguous() # b h sk d
-    grad__kv = torch.zeros((b, h, sk, 576), device=q.device, dtype=q.dtype) # b h sk d
+    grad__kv = torch.zeros((b, h, sk, d), device=q.device, dtype=q.dtype) # b h sk d
     grad__kv[:,:,:,:dim_short] = grad__v + grad__k_T[:,:,:,:dim_short]
     grad__kv[:,:,:,dim_short:] = torch.matmul(_q_tail_T, grad_attn_w).contiguous().transpose(2, 3).contiguous() # b h sk d
 
