@@ -51,7 +51,7 @@ def postprocess(
     D_tail,
     kv_group=1,
     block_N=64,
-    threads=128,
+    threads=256,
     dtype=T.bfloat16,
     accum_dtype=T.float32,
 ):
@@ -145,7 +145,7 @@ def bwd(
             Q_shared = T.alloc_shared([block_H, D], dtype)
             Q_tail_shared = T.alloc_shared([block_H, D_tail], dtype)
             KV_shared = T.alloc_shared([BS, D], dtype)
-            KV_tail_shared = T.alloc_shared([BS, D_tail], dtype)
+            KV_tail_shared = T.alloc_shared([BS, D_tail * 4], dtype)
             dO_shared = T.alloc_shared([block_H, D], dtype)
 
             P_shared_cast = T.alloc_shared([block_H, BS], dtype)
@@ -156,7 +156,7 @@ def bwd(
             acc_p = T.alloc_fragment([block_H, BS], accum_dtype)
             acc_dp = T.alloc_fragment([block_H, BS], accum_dtype)
             acc_dq = T.alloc_fragment([block_H, D], accum_dtype)
-            acc_dq_tail = T.alloc_fragment([block_H, D_tail], accum_dtype)
+            acc_dq_tail = T.alloc_fragment([block_H, D_tail * 4], accum_dtype)
             acc_dkv = T.alloc_fragment([BS, D], accum_dtype)
             acc_dkv_tail = T.alloc_fragment([BS, D_tail], accum_dtype)
             acc_dkv_shared = T.alloc_shared([BS // split_store, D], accum_dtype)
@@ -185,7 +185,7 @@ def bwd(
 
                 for bi_i, d_i in T.Parallel(BS, D_tail):
                     KV_tail_shared[bi_i, d_i] = KV[by, Indices[by, s_i, bz // NH, i_i * BS + bi_i], bz // NH, D + d_i]
-                T.gemm(Q_tail_shared, KV_tail_shared, acc_p, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
+                T.gemm(Q_tail_shared, KV_tail_shared[:, :D_tail], acc_p, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
 
                 for h_i, bi_i in T.Parallel(block_H, BS):
                     acc_p[h_i, bi_i] = T.exp2(acc_p[h_i, bi_i] * sm_scale_mul_reciprocal_log2 - Lse[by, s_i, bz * block_H + h_i])
@@ -231,7 +231,7 @@ def bwd(
 
             # Store the accumulated dQ
             T.copy(acc_dq, dQ_shared)
-            T.copy(acc_dq_tail, dQ_tail_shared)
+            T.copy(acc_dq_tail[:, :D_tail], dQ_tail_shared)
 
             T.copy(dQ_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, :D])
             T.copy(dQ_tail_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, D:])
@@ -239,7 +239,7 @@ def bwd(
     return sparse_mla_bwd_kernel
 
 
-def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None, is_casual=True, return_kernel=False, delta=None):
+def sparse_mla_bwd(q, kv, o, do, indices, dim_v, lse, sm_scale=None, is_casual=True, return_kernel=False, delta=None):
     assert q.is_contiguous()
     assert kv.is_contiguous()
     assert indices.is_contiguous()
@@ -249,7 +249,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None, is_casual=True, re
     assert kv.shape[-1] == dim_plus_tail_dim
     assert kv.shape[0] == B
     # dim should be assigned
-    D = 512
+    D = dim_v
 
     D_tail = dim_plus_tail_dim - D
     topk = indices.shape[-1]
@@ -268,100 +268,3 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None, is_casual=True, re
     dkv = postprocess_kernel(dkv)
 
     return dq, dkv
-
-
-def ref_sparse_mla_bwd_interface(q, kv, o, do, indices, lse, sm_scale=None, is_casual=True):
-    from sparse_mla_fwd import ref_sparse_mla_fwd_interface
-
-    q = q.detach().clone()
-    kv = kv.detach().clone()
-    q.requires_grad = True
-    kv.requires_grad = True
-    o = ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale, is_casual)
-    o.backward(do)
-    return q.grad, kv.grad
-
-
-def test_sparse_mla_bwd(B=1, S=4096, SKV=8192, H=64, HKV=1, DQKV=576, DV=512, topk=2048, dtype=torch.bfloat16, check_correctness=True):
-    # Prepare data
-    q = torch.randn((B, S, H, DQKV), dtype=dtype, device="cuda").requires_grad_(True)
-    kv = torch.randn((B, SKV, HKV, DQKV), dtype=dtype, device="cuda").requires_grad_(True)
-    do = torch.randn((B, S, H, DV), dtype=dtype, device="cuda")
-
-    indices = torch.full((B, S, HKV, topk), SKV, dtype=torch.int32, device="cuda")
-    for b in range(B):
-        for t in range(S):
-            for h in range(HKV):
-                i_i = torch.randperm(max(1, t))[:topk]
-                indices[b, t, h, : len(i_i)] = i_i
-
-    # Forward
-    from sparse_mla_fwd import sparse_mla_fwd_interface
-
-    tl_out, tl_lse = sparse_mla_fwd_interface(q, kv, indices)
-
-    tl_dq, tl_dkv = sparse_mla_bwd(q, kv, tl_out, do, indices, tl_lse)
-    ref_dq, ref_dkv = ref_sparse_mla_bwd_interface(q, kv, None, do, indices, None)
-
-    if check_correctness:
-        assert_tensors_similar(tl_dq, ref_dq, eps=1e-4, name="dq")
-        assert_tensors_similar(tl_dkv, ref_dkv, eps=1e-4, name="dkv")
-        print("assert_tensors_similar passed")
-
-    per_token_flop = 2 * sum(
-        [
-            H * DV * topk,
-            H * DQKV * topk,
-            H * DQKV * topk,
-            H * DQKV * topk,
-            H * DV * topk,
-        ]
-    )
-    from tilelang.profiler import do_bench
-
-    def fn():
-        return sparse_mla_bwd(q, kv, tl_out, do, indices, tl_lse)
-
-    ms = do_bench(fn, rep=100, warmup=250)
-    print(f"Average time: {ms:.3f} ms")
-    print(f"bwd io bandwidth = ", (B * S * max(DQKV * 2, DQKV + DV) * topk * 2) / (ms * 1e-3) / 1e12)
-    print(f"bwd tflops = ", per_token_flop * S / (ms * 1e-3) / 1e12)
-
-
-def run_regression_perf(B=1, S=4096, SKV=8192, H=64, HKV=1, DQKV=576, DV=512, topk=2048, dtype=torch.bfloat16):
-    torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
-    q = torch.randn((B, S, H, DQKV), dtype=dtype, device="cuda").requires_grad_(True)
-    kv = torch.randn((B, SKV, HKV, DQKV), dtype=dtype, device="cuda").requires_grad_(True)
-    do = torch.randn((B, S, H, DV), dtype=dtype, device="cuda")
-
-    indices = torch.full((B, S, HKV, topk), SKV, dtype=torch.int32, device="cuda")
-    for b in range(B):
-        for t in range(S):
-            for h in range(HKV):
-                i_i = torch.randperm(max(1, t))[:topk]
-                indices[b, t, h, : len(i_i)] = i_i
-
-    from sparse_mla_fwd import sparse_mla_fwd_interface
-
-    tl_out, tl_lse = sparse_mla_fwd_interface(q, kv, indices)
-    B, S, H, dim_plus_tail_dim = q.shape
-    _, S_kv, kv_group, _ = kv.shape
-    D = 512
-    D_tail = dim_plus_tail_dim - D
-    topk = indices.shape[-1]
-    preprocess_kernel = preprocess(B, S, H, D)
-    bwd_kernel = bwd(B, S, S_kv, H, D, D_tail, topk, kv_group, None, True)
-    delta = preprocess_kernel(tl_out, do)
-    dkv = torch.zeros_like(kv, dtype=torch.float32)
-
-    from tilelang.profiler import do_bench
-
-    def run_kernel_only():
-        return bwd_kernel(q, kv, do, indices, tl_lse, delta, dkv)
-
-    return do_bench(run_kernel_only, backend="cupti")
-
-
-if __name__ == "__main__":
-    test_sparse_mla_bwd(B=1, S=4096, SKV=8192, H=64, HKV=1, DQKV=576, DV=512, topk=2048, dtype=torch.bfloat16, check_correctness=True)

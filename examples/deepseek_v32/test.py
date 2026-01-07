@@ -3,8 +3,6 @@ import torch
 import torch.distributed as dist
 from torch.nn import functional as F
 import os
-from sparse_mla_fwd import sparse_mla_fwd_interface, ref_sparse_mla_fwd_interface, ref_sparse_mla_fwd_interface_no_mask
-from sparse_mla_bwd import sparse_mla_bwd
 from ring_ref import Ref
 from ring_wrapper import AttentionFuncionWithContextParallel
 
@@ -159,7 +157,7 @@ def test_kernel(
     k_local.grad = None
     v_local.grad = None
     kv_local.grad = None
-    res2 = AttentionFuncionWithContextParallel.apply(q_local, kv_local, indices_local, topk, attention_dropout, sm_scale, cp_pg)
+    res2 = AttentionFuncionWithContextParallel.apply(q_local, kv_local, indices_local, dim, topk, attention_dropout, sm_scale, cp_pg)
     res2.backward(do)
     dq = q_local.grad
     dkv = kv_local.grad
@@ -170,4 +168,4 @@ def test_kernel(
 
 
 # run this test: rm -rf /tmp/tilelang_cache_clean && CUDA_VISIBLE_DEVICES=4,5,6,7 TILELANG_CACHE_DIR=/tmp/tilelang_cache_clean torchrun --nproc_per_node=4 /root/tilelang/examples/deepseek_v32/test.py
-test_kernel(32, 512, 512, 512, 64, 128, 128, 128, 4)
+test_kernel(32, 512, 512, 512 // 4, 64 // 4, 128, 128, 128, 4)
