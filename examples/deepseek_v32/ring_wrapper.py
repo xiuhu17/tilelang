@@ -3,6 +3,7 @@
 # Some of this code was adopted from https://github.com/zhuzilin/ring-flash-attention/
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
+# Kernel is adpoted from tilelang/examples/deepseek_v32
 
 import torch
 import torch.distributed as dist
@@ -52,8 +53,9 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
     #   k: [seq_len_kv_shard, batch, kv_group, dim + tail_dim]
     #   v: [seq_len_kv_shard, batch, kv_group, dim]
     # indices: [batch, kv_group, seq_len, topk]
+    # masks: [batch, kv_group, seq_len, seq_len_kv]
     @staticmethod
-    def forward(ctx, q, kv, indices, dim_v, K, attention_dropout, softmax_scale, pg):
+    def forward(ctx, q, kv, v, indices, masks, dim_v, K, attention_dropout, softmax_scale, pg):
         '''Forward pass for the native attention function with context parallelism'''
 
         # Assert einops exists
@@ -86,6 +88,7 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
 
         # Prepare topk
         zz_indices = indices.transpose(1, 2)
+        zz_masks = masks.transpose(1, 2)
         
         # Iterate over heads, sequential, i
         for i in range(0, kv_group, heads_kv_stride):
@@ -105,11 +108,17 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
 
             # Rearrange query, key, value to (b, s, h, d)
             q_i = einops.rearrange(q_i, 's b h d -> b s h d')
-            kv_i = einops.rearrange(kv_i, 's b h d -> b s h d')
-            zz_indices_i = zz_indices[:, :, i:(i+heads_kv_stride)].contiguous()
+            s_, b_, h_, d_ = kv_i.shape
+            kv_i = einops.rearrange(kv_i, 's b h d -> b s h d').flatten().view(b_, s_, h_, d_)
+            zz_indices_i = zz_indices[:, :, i:(i+heads_kv_stride)]
+            b_, s_, g_, topk_ = zz_indices_i.shape
+            zz_indices_i = zz_indices_i.flatten().view(b_, s_, g_, topk_)
+            zz_masks_i =  zz_masks[:, :, i:(i+heads_kv_stride)]
+            b_, s_, g_, skv_ = zz_masks_i.shape
+            zz_masks_i = zz_masks_i.flatten().view(b_, s_, g_, skv_)
 
             # Forward pass
-            out_i, lse_i = sparse_mla_fwd_interface(q_i.contiguous(), kv_i.contiguous(), zz_indices_i, dim_v, sm_scale = softmax_scale)
+            out_i, lse_i = sparse_mla_fwd_interface(q_i.contiguous(), kv_i, zz_indices_i, zz_masks_i, dim_v, sm_scale = softmax_scale)
 
             outs.append(out_i.contiguous())
             lses.append(lse_i.contiguous())
@@ -121,7 +130,7 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
         # Save contexts for backward pass
         # outs: [[B, seq_len_shard, nheads // kv_group, dim], ...., [B, seq_len_shard, nheads // kv_group, dim]], repeat kv_group // heads_kv_stride times
         # lses: [[B, seq_len_shard, heads_kv_stride], ...., [B, seq_len_shard, heads_kv_stride]], repeat kv_group // heads_kv_stride times
-        ctx.save_for_backward(q, kv, indices, *outs, *lses)
+        ctx.save_for_backward(q, kv, indices, masks, *outs, *lses)
         ctx.K = K
         ctx.dropout = attention_dropout
         ctx.softmax_scale = softmax_scale
@@ -136,7 +145,7 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
         '''Backward pass for the native attention function with context parallelism'''
 
         # Initialize or resume constants and communication group
-        q, kv, indices, *rest = ctx.saved_tensors
+        q, kv, indices, masks, *rest = ctx.saved_tensors
         K = ctx.K
         dim_v = ctx.dim_v
         nheads = q.shape[2]
@@ -170,6 +179,7 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
 
         # Prepare topk
         zz_indices = indices.transpose(1, 2)
+        zz_masks = masks.transpose(1, 2)
 
         # Iterate over heads
         for i in range(0, kv_group, heads_kv_stride):
@@ -194,13 +204,19 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
 
             # Rearrange query, key, value to (b, s, h, d)
             q_i = einops.rearrange(q_i, 's b h d -> b s h d')
-            kv_i = einops.rearrange(kv_i, 's b h d -> b s h d')
+            s_, b_, h_, d_ = kv_i.shape
+            kv_i = einops.rearrange(kv_i, 's b h d -> b s h d').flatten().view(b_, s_, h_, d_)
             dout_i = einops.rearrange(dout_i, 's b h d -> b s h d')
-            zz_indices_i = zz_indices[:, :, i:(i+heads_kv_stride)].contiguous()
+            zz_indices_i = zz_indices[:, :, i:(i+heads_kv_stride)]
+            b_, s_, g_, topk_ = zz_indices_i.shape
+            zz_indices_i = zz_indices_i.flatten().view(b_, s_, g_, topk_)
+            zz_masks_i =  zz_masks[:, :, i:(i+heads_kv_stride)]
+            b_, s_, g_, skv_ = zz_masks_i.shape
+            zz_masks_i = zz_masks_i.flatten().view(b_, s_, g_, skv_)
 
             # Backward pass
             # TODO: needs casual = True, may not be compatible with zz
-            dq_i, _dkv_i = sparse_mla_bwd(q_i.contiguous(), kv_i.contiguous(), outs[i], dout_i.contiguous(), zz_indices_i, dim_v, lses[i], softmax_scale, True)
+            dq_i, _dkv_i = sparse_mla_bwd(q_i.contiguous(), kv_i, outs[i], dout_i.contiguous(), zz_indices_i, zz_masks_i, lses[i], dim_v, softmax_scale, True)
             
             # Rearrange gradients to (s, b, h, d)
             dq_i = einops.rearrange(dq_i, 'b s h d -> s b h d')
@@ -223,7 +239,4 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
         # Concatenate gradients and return
         dq = torch.cat(dq, dim=2)
         dkv = torch.cat(dkv, dim=2)
-        return dq, dkv, None, None, None, None, None, None
-
-
-
+        return dq, dkv, dkv[:,:,:,:dim_v].detach().contiguous(), None, None, None, None, None, None, None

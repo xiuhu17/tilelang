@@ -44,6 +44,9 @@ def sparse_mla_fwd(
     o_shape = [batch, seq_len, heads, dim]
     indices_shape = [batch, seq_len, kv_group, topk]
     lse_shape = [batch, seq_len, heads]
+    masks_shape = [batch, seq_len, kv_group, seq_len_kv]
+
+    masks_dtype = T.bool
     indices_dtype = T.int32
     dtype = T.bfloat16
     accum_dtype = T.float32
@@ -73,6 +76,7 @@ def sparse_mla_fwd(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
+        Masks: T.Tensor(masks_shape, masks_dtype), # type: ignore
         Output: T.Tensor(o_shape, dtype),  # type: ignore
         Lse: T.Tensor(lse_shape, accum_dtype),  # type: ignore
     ):
@@ -113,12 +117,14 @@ def sparse_mla_fwd(
             T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
 
             for i_i in T.Pipelined(NI, num_stages=num_stages):
+                for bi_i in T.Parallel(BI):
+                    mask[bi_i] = Masks[b_i, s_i, g_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i]]
                 for bi_i, d_i in T.Parallel(BI, D):
                     KV_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i]
                 for bi_i, d_i in T.Parallel(BI, D_tail):
                     K_tail_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i]
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
-                    acc_s[h_i, bi_i] = 0
+                    acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], -T.infinity(acc_s.dtype), 0)
                 T.gemm(
                     Q_shared,
                     KV_shared,
@@ -164,7 +170,7 @@ def sparse_mla_fwd(
     return main
 
 
-def sparse_mla_fwd_interface(q, kv, indices, d_v, sm_scale=None, return_p_sum: bool = False, block_I=64, num_stages=2, threads=256):
+def sparse_mla_fwd_interface(q, kv, indices, masks, d_v, sm_scale=None, return_p_sum: bool = False, block_I=64, num_stages=2, threads=256):
     is_casual = True
     assert return_p_sum == False, "This kernel file is for fwd only"
     assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous()
@@ -176,9 +182,10 @@ def sparse_mla_fwd_interface(q, kv, indices, d_v, sm_scale=None, return_p_sum: b
     assert kv.shape[0] == batch
     _, _, _, topk = indices.shape
     assert indices.shape == (batch, seq_len, kv_group, topk)
+    assert masks.shape == (batch, seq_len, kv_group, seq_len_kv)
 
     kernel = sparse_mla_fwd(
         heads, d_v, tail_dim, topk, kv_group, sm_scale, is_casual, block_I=block_I, num_stages=num_stages, threads=threads
     )
-    out, lse = kernel(q, kv, indices)
+    out, lse = kernel(q, kv, indices, masks)
     return out, lse

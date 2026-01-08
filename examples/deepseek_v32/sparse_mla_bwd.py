@@ -98,6 +98,7 @@ def bwd(
     indices_dtype=T.int32,
     dtype=T.bfloat16,
     accum_dtype=T.float32,
+    masks_dtype=T.bool,
 ):
     assert is_causal == True, "non-casual is not supported now"
     assert topk % block_size == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
@@ -116,6 +117,7 @@ def bwd(
     indices_shape = [B, S, kv_group, topk]
     delta_shape = [B, S, H]
     lse_shape = [B, S, H]
+    masks_shape = [B, S, kv_group, S_kv]
     assert indices_dtype == T.int32
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
@@ -136,6 +138,7 @@ def bwd(
         KV: T.Tensor(k_shape, dtype),
         dO: T.Tensor(o_shape, dtype),
         Indices: T.Tensor(indices_shape, indices_dtype),
+        Masks: T.Tensor(masks_shape, masks_dtype),
         Lse: T.Tensor(lse_shape, accum_dtype),
         Delta: T.Tensor(delta_shape, accum_dtype),
         dQ: T.Tensor(q_shape, dtype),
@@ -147,6 +150,7 @@ def bwd(
             KV_shared = T.alloc_shared([BS, D], dtype)
             KV_tail_shared = T.alloc_shared([BS, D_tail * 4], dtype)
             dO_shared = T.alloc_shared([block_H, D], dtype)
+            mask = T.alloc_fragment([BS], "bool")
 
             P_shared_cast = T.alloc_shared([block_H, BS], dtype)
             dP_shared_cast = T.alloc_shared([block_H, BS], dtype)
@@ -162,8 +166,6 @@ def bwd(
             acc_dkv_shared = T.alloc_shared([BS // split_store, D], accum_dtype)
             acc_dkv_tail_shared = T.alloc_shared([BS // split_store, D_tail], accum_dtype)
 
-            max_kv_i = s_i
-
             T.copy(Q[by, s_i, bz * block_H : (bz + 1) * block_H, :D], Q_shared)
             T.copy(Q[by, s_i, bz * block_H : (bz + 1) * block_H, D:], Q_tail_shared)
             T.copy(dO[by, s_i, bz * block_H : (bz + 1) * block_H, :D], dO_shared)
@@ -174,8 +176,11 @@ def bwd(
             # Process each block of indices
             for i_i in T.Pipelined(NS, num_stages=num_stages):
                 # Compute attention scores
+                for bi_i in T.Parallel(BS):
+                    mask[bi_i] = Masks[by, s_i, bz // NH, Indices[by, s_i, bz // NH, i_i * BS + bi_i]]
+
                 for h_i, bi_i in T.Parallel(block_H, BS):
-                    acc_p[h_i, bi_i] = 0
+                    acc_p[h_i, bi_i] = T.if_then_else(mask[bi_i], -T.infinity(acc_p.dtype), 0)
 
                 # Load KV, V for this block of indices
                 for bi_i, d_i in T.Parallel(BS, D):
@@ -239,7 +244,7 @@ def bwd(
     return sparse_mla_bwd_kernel
 
 
-def sparse_mla_bwd(q, kv, o, do, indices, dim_v, lse, sm_scale=None, is_casual=True, return_kernel=False, delta=None):
+def sparse_mla_bwd(q, kv, o, do, indices, masks, lse, dim_v, sm_scale=None, is_casual=True, return_kernel=False, delta=None):
     assert q.is_contiguous()
     assert kv.is_contiguous()
     assert indices.is_contiguous()
@@ -264,7 +269,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, dim_v, lse, sm_scale=None, is_casual=T
     if delta is None:
         delta = preprocess_kernel(o, do)
     dkv = torch.zeros_like(kv, dtype=torch.float32)
-    dq = bwd_kernel(q, kv, do, indices, lse, delta, dkv)
+    dq = bwd_kernel(q, kv, do, indices, masks, lse, delta, dkv)
     dkv = postprocess_kernel(dkv)
 
     return dq, dkv

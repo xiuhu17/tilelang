@@ -351,15 +351,16 @@ index 00000000..f62f2257
 +        return dq, dkv, dkv[:,:,:,:dim_short].detach().contiguous(), None, None, None, None, None
 diff --git a/examples/deepseek_v32/ring_wrapper.py b/examples/deepseek_v32/ring_wrapper.py
 new file mode 100644
-index 00000000..f9f11831
+index 00000000..1172edee
 --- /dev/null
 +++ b/examples/deepseek_v32/ring_wrapper.py
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,242 @@
 +# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +
 +# Some of this code was adopted from https://github.com/zhuzilin/ring-flash-attention/
 +# This source code is licensed under the MIT license found in the
 +# LICENSE file in the root directory of this source tree.
++# Kernel is adpoted from tilelang/examples/deepseek_v32
 +
 +import torch
 +import torch.distributed as dist
@@ -409,8 +410,9 @@ index 00000000..f9f11831
 +    #   k: [seq_len_kv_shard, batch, kv_group, dim + tail_dim]
 +    #   v: [seq_len_kv_shard, batch, kv_group, dim]
 +    # indices: [batch, kv_group, seq_len, topk]
++    # masks: [batch, kv_group, seq_len, seq_len_kv]
 +    @staticmethod
-+    def forward(ctx, q, kv, indices, dim_v, K, attention_dropout, softmax_scale, pg):
++    def forward(ctx, q, kv, v, indices, masks, dim_v, K, attention_dropout, softmax_scale, pg):
 +        '''Forward pass for the native attention function with context parallelism'''
 +
 +        # Assert einops exists
@@ -443,6 +445,7 @@ index 00000000..f9f11831
 +
 +        # Prepare topk
 +        zz_indices = indices.transpose(1, 2)
++        zz_masks = masks.transpose(1, 2)
 +        
 +        # Iterate over heads, sequential, i
 +        for i in range(0, kv_group, heads_kv_stride):
@@ -462,11 +465,17 @@ index 00000000..f9f11831
 +
 +            # Rearrange query, key, value to (b, s, h, d)
 +            q_i = einops.rearrange(q_i, 's b h d -> b s h d')
-+            kv_i = einops.rearrange(kv_i, 's b h d -> b s h d')
-+            zz_indices_i = zz_indices[:, :, i:(i+heads_kv_stride)].contiguous()
++            s_, b_, h_, d_ = kv_i.shape
++            kv_i = einops.rearrange(kv_i, 's b h d -> b s h d').flatten().view(b_, s_, h_, d_)
++            zz_indices_i = zz_indices[:, :, i:(i+heads_kv_stride)]
++            b_, s_, g_, topk_ = zz_indices_i.shape
++            zz_indices_i = zz_indices_i.flatten().view(b_, s_, g_, topk_)
++            zz_masks_i =  zz_masks[:, :, i:(i+heads_kv_stride)]
++            b_, s_, g_, skv_ = zz_masks_i.shape
++            zz_masks_i = zz_masks_i.flatten().view(b_, s_, g_, skv_)
 +
 +            # Forward pass
-+            out_i, lse_i = sparse_mla_fwd_interface(q_i.contiguous(), kv_i.contiguous(), zz_indices_i, dim_v, sm_scale = softmax_scale)
++            out_i, lse_i = sparse_mla_fwd_interface(q_i.contiguous(), kv_i, zz_indices_i, zz_masks_i, dim_v, sm_scale = softmax_scale)
 +
 +            outs.append(out_i.contiguous())
 +            lses.append(lse_i.contiguous())
@@ -478,7 +487,7 @@ index 00000000..f9f11831
 +        # Save contexts for backward pass
 +        # outs: [[B, seq_len_shard, nheads // kv_group, dim], ...., [B, seq_len_shard, nheads // kv_group, dim]], repeat kv_group // heads_kv_stride times
 +        # lses: [[B, seq_len_shard, heads_kv_stride], ...., [B, seq_len_shard, heads_kv_stride]], repeat kv_group // heads_kv_stride times
-+        ctx.save_for_backward(q, kv, indices, *outs, *lses)
++        ctx.save_for_backward(q, kv, indices, masks, *outs, *lses)
 +        ctx.K = K
 +        ctx.dropout = attention_dropout
 +        ctx.softmax_scale = softmax_scale
@@ -493,7 +502,7 @@ index 00000000..f9f11831
 +        '''Backward pass for the native attention function with context parallelism'''
 +
 +        # Initialize or resume constants and communication group
-+        q, kv, indices, *rest = ctx.saved_tensors
++        q, kv, indices, masks, *rest = ctx.saved_tensors
 +        K = ctx.K
 +        dim_v = ctx.dim_v
 +        nheads = q.shape[2]
@@ -527,6 +536,7 @@ index 00000000..f9f11831
 +
 +        # Prepare topk
 +        zz_indices = indices.transpose(1, 2)
++        zz_masks = masks.transpose(1, 2)
 +
 +        # Iterate over heads
 +        for i in range(0, kv_group, heads_kv_stride):
@@ -551,13 +561,19 @@ index 00000000..f9f11831
 +
 +            # Rearrange query, key, value to (b, s, h, d)
 +            q_i = einops.rearrange(q_i, 's b h d -> b s h d')
-+            kv_i = einops.rearrange(kv_i, 's b h d -> b s h d')
++            s_, b_, h_, d_ = kv_i.shape
++            kv_i = einops.rearrange(kv_i, 's b h d -> b s h d').flatten().view(b_, s_, h_, d_)
 +            dout_i = einops.rearrange(dout_i, 's b h d -> b s h d')
-+            zz_indices_i = zz_indices[:, :, i:(i+heads_kv_stride)].contiguous()
++            zz_indices_i = zz_indices[:, :, i:(i+heads_kv_stride)]
++            b_, s_, g_, topk_ = zz_indices_i.shape
++            zz_indices_i = zz_indices_i.flatten().view(b_, s_, g_, topk_)
++            zz_masks_i =  zz_masks[:, :, i:(i+heads_kv_stride)]
++            b_, s_, g_, skv_ = zz_masks_i.shape
++            zz_masks_i = zz_masks_i.flatten().view(b_, s_, g_, skv_)
 +
 +            # Backward pass
 +            # TODO: needs casual = True, may not be compatible with zz
-+            dq_i, _dkv_i = sparse_mla_bwd(q_i.contiguous(), kv_i.contiguous(), outs[i], dout_i.contiguous(), zz_indices_i, dim_v, lses[i], softmax_scale, True)
++            dq_i, _dkv_i = sparse_mla_bwd(q_i.contiguous(), kv_i, outs[i], dout_i.contiguous(), zz_indices_i, zz_masks_i, lses[i], dim_v, softmax_scale, True)
 +            
 +            # Rearrange gradients to (s, b, h, d)
 +            dq_i = einops.rearrange(dq_i, 'b s h d -> s b h d')
@@ -580,12 +596,9 @@ index 00000000..f9f11831
 +        # Concatenate gradients and return
 +        dq = torch.cat(dq, dim=2)
 +        dkv = torch.cat(dkv, dim=2)
-+        return dq, dkv, None, None, None, None, None, None
-+
-+
-+
++        return dq, dkv, dkv[:,:,:,:dim_v].detach().contiguous(), None, None, None, None, None, None, None
 diff --git a/examples/deepseek_v32/sparse_mla_bwd.py b/examples/deepseek_v32/sparse_mla_bwd.py
-index 527de22b..7f4c9876 100644
+index 527de22b..1201b284 100644
 --- a/examples/deepseek_v32/sparse_mla_bwd.py
 +++ b/examples/deepseek_v32/sparse_mla_bwd.py
 @@ -51,7 +51,7 @@ def postprocess(
@@ -597,7 +610,7 @@ index 527de22b..7f4c9876 100644
      dtype=T.bfloat16,
      accum_dtype=T.float32,
  ):
-@@ -94,7 +94,7 @@ def bwd(
+@@ -94,10 +94,11 @@ def bwd(
      is_causal=True,
      block_size=32,
      num_stages=0,
@@ -606,18 +619,36 @@ index 527de22b..7f4c9876 100644
      indices_dtype=T.int32,
      dtype=T.bfloat16,
      accum_dtype=T.float32,
-@@ -145,9 +145,8 @@ def bwd(
++    masks_dtype=T.bool,
+ ):
+     assert is_causal == True, "non-casual is not supported now"
+     assert topk % block_size == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
+@@ -116,6 +117,7 @@ def bwd(
+     indices_shape = [B, S, kv_group, topk]
+     delta_shape = [B, S, H]
+     lse_shape = [B, S, H]
++    masks_shape = [B, S, kv_group, S_kv]
+     assert indices_dtype == T.int32
+     assert dtype == T.bfloat16
+     assert accum_dtype == T.float32
+@@ -136,6 +138,7 @@ def bwd(
+         KV: T.Tensor(k_shape, dtype),
+         dO: T.Tensor(o_shape, dtype),
+         Indices: T.Tensor(indices_shape, indices_dtype),
++        Masks: T.Tensor(masks_shape, masks_dtype),
+         Lse: T.Tensor(lse_shape, accum_dtype),
+         Delta: T.Tensor(delta_shape, accum_dtype),
+         dQ: T.Tensor(q_shape, dtype),
+@@ -145,7 +148,7 @@ def bwd(
              Q_shared = T.alloc_shared([block_H, D], dtype)
              Q_tail_shared = T.alloc_shared([block_H, D_tail], dtype)
              KV_shared = T.alloc_shared([BS, D], dtype)
 -            KV_tail_shared = T.alloc_shared([BS, D_tail], dtype)
 +            KV_tail_shared = T.alloc_shared([BS, D_tail * 4], dtype)
              dO_shared = T.alloc_shared([block_H, D], dtype)
--            mask = T.alloc_fragment([BS], "bool")
+             mask = T.alloc_fragment([BS], "bool")
  
-             P_shared_cast = T.alloc_shared([block_H, BS], dtype)
-             dP_shared_cast = T.alloc_shared([block_H, BS], dtype)
-@@ -157,7 +156,7 @@ def bwd(
+@@ -157,14 +160,12 @@ def bwd(
              acc_p = T.alloc_fragment([block_H, BS], accum_dtype)
              acc_dp = T.alloc_fragment([block_H, BS], accum_dtype)
              acc_dq = T.alloc_fragment([block_H, D], accum_dtype)
@@ -626,22 +657,31 @@ index 527de22b..7f4c9876 100644
              acc_dkv = T.alloc_fragment([BS, D], accum_dtype)
              acc_dkv_tail = T.alloc_fragment([BS, D_tail], accum_dtype)
              acc_dkv_shared = T.alloc_shared([BS // split_store, D], accum_dtype)
-@@ -174,13 +173,9 @@ def bwd(
+             acc_dkv_tail_shared = T.alloc_shared([BS // split_store, D_tail], accum_dtype)
+ 
+-            max_kv_i = s_i
+-
+             T.copy(Q[by, s_i, bz * block_H : (bz + 1) * block_H, :D], Q_shared)
+             T.copy(Q[by, s_i, bz * block_H : (bz + 1) * block_H, D:], Q_tail_shared)
+             T.copy(dO[by, s_i, bz * block_H : (bz + 1) * block_H, :D], dO_shared)
+@@ -174,13 +175,12 @@ def bwd(
  
              # Process each block of indices
              for i_i in T.Pipelined(NS, num_stages=num_stages):
 -                # Check which indices are valid
--                for bi_i in T.Parallel(BS):
++                # Compute attention scores
+                 for bi_i in T.Parallel(BS):
 -                    mask[bi_i] = Indices[by, s_i, bz // NH, i_i * BS + bi_i] <= max_kv_i
--
-                 # Compute attention scores
++                    mask[bi_i] = Masks[by, s_i, bz // NH, Indices[by, s_i, bz // NH, i_i * BS + bi_i]]
+ 
+-                # Compute attention scores
                  for h_i, bi_i in T.Parallel(block_H, BS):
 -                    acc_p[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_p.dtype))
-+                    acc_p[h_i, bi_i] = 0
++                    acc_p[h_i, bi_i] = T.if_then_else(mask[bi_i], -T.infinity(acc_p.dtype), 0)
  
                  # Load KV, V for this block of indices
                  for bi_i, d_i in T.Parallel(BS, D):
-@@ -190,7 +185,7 @@ def bwd(
+@@ -190,7 +190,7 @@ def bwd(
  
                  for bi_i, d_i in T.Parallel(BS, D_tail):
                      KV_tail_shared[bi_i, d_i] = KV[by, Indices[by, s_i, bz // NH, i_i * BS + bi_i], bz // NH, D + d_i]
@@ -650,7 +690,7 @@ index 527de22b..7f4c9876 100644
  
                  for h_i, bi_i in T.Parallel(block_H, BS):
                      acc_p[h_i, bi_i] = T.exp2(acc_p[h_i, bi_i] * sm_scale_mul_reciprocal_log2 - Lse[by, s_i, bz * block_H + h_i])
-@@ -236,7 +231,7 @@ def bwd(
+@@ -236,7 +236,7 @@ def bwd(
  
              # Store the accumulated dQ
              T.copy(acc_dq, dQ_shared)
@@ -659,16 +699,16 @@ index 527de22b..7f4c9876 100644
  
              T.copy(dQ_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, :D])
              T.copy(dQ_tail_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, D:])
-@@ -244,7 +239,7 @@ def bwd(
+@@ -244,7 +244,7 @@ def bwd(
      return sparse_mla_bwd_kernel
  
  
 -def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None, is_casual=True, return_kernel=False, delta=None):
-+def sparse_mla_bwd(q, kv, o, do, indices, dim_v, lse, sm_scale=None, is_casual=True, return_kernel=False, delta=None):
++def sparse_mla_bwd(q, kv, o, do, indices, masks, lse, dim_v, sm_scale=None, is_casual=True, return_kernel=False, delta=None):
      assert q.is_contiguous()
      assert kv.is_contiguous()
      assert indices.is_contiguous()
-@@ -254,7 +249,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None, is_casual=True, re
+@@ -254,7 +254,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None, is_casual=True, re
      assert kv.shape[-1] == dim_plus_tail_dim
      assert kv.shape[0] == B
      # dim should be assigned
@@ -677,7 +717,12 @@ index 527de22b..7f4c9876 100644
  
      D_tail = dim_plus_tail_dim - D
      topk = indices.shape[-1]
-@@ -273,100 +268,3 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None, is_casual=True, re
+@@ -269,104 +269,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None, is_casual=True, re
+     if delta is None:
+         delta = preprocess_kernel(o, do)
+     dkv = torch.zeros_like(kv, dtype=torch.float32)
+-    dq = bwd_kernel(q, kv, do, indices, lse, delta, dkv)
++    dq = bwd_kernel(q, kv, do, indices, masks, lse, delta, dkv)
      dkv = postprocess_kernel(dkv)
  
      return dq, dkv
@@ -779,10 +824,28 @@ index 527de22b..7f4c9876 100644
 -if __name__ == "__main__":
 -    test_sparse_mla_bwd(B=1, S=4096, SKV=8192, H=64, HKV=1, DQKV=576, DV=512, topk=2048, dtype=torch.bfloat16, check_correctness=True)
 diff --git a/examples/deepseek_v32/sparse_mla_fwd.py b/examples/deepseek_v32/sparse_mla_fwd.py
-index 2c8bf7fc..42f3ae02 100644
+index 2c8bf7fc..2ae1a14c 100644
 --- a/examples/deepseek_v32/sparse_mla_fwd.py
 +++ b/examples/deepseek_v32/sparse_mla_fwd.py
-@@ -105,7 +105,6 @@ def sparse_mla_fwd(
+@@ -44,6 +44,9 @@ def sparse_mla_fwd(
+     o_shape = [batch, seq_len, heads, dim]
+     indices_shape = [batch, seq_len, kv_group, topk]
+     lse_shape = [batch, seq_len, heads]
++    masks_shape = [batch, seq_len, kv_group, seq_len_kv]
++
++    masks_dtype = T.bool
+     indices_dtype = T.int32
+     dtype = T.bfloat16
+     accum_dtype = T.float32
+@@ -73,6 +76,7 @@ def sparse_mla_fwd(
+         Q: T.Tensor(q_shape, dtype),  # type: ignore
+         KV: T.Tensor(kv_shape, dtype),  # type: ignore
+         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
++        Masks: T.Tensor(masks_shape, masks_dtype), # type: ignore
+         Output: T.Tensor(o_shape, dtype),  # type: ignore
+         Lse: T.Tensor(lse_shape, accum_dtype),  # type: ignore
+     ):
+@@ -105,7 +109,6 @@ def sparse_mla_fwd(
              b_i, g_i = by, bz
              s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
              q_i = s_i
@@ -790,13 +853,13 @@ index 2c8bf7fc..42f3ae02 100644
  
              H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
              H1 = H0 + H_per_block
-@@ -114,16 +113,12 @@ def sparse_mla_fwd(
-             T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
+@@ -115,15 +118,13 @@ def sparse_mla_fwd(
  
              for i_i in T.Pipelined(NI, num_stages=num_stages):
--                for bi_i in T.Parallel(BI):
+                 for bi_i in T.Parallel(BI):
 -                    mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] <= max_kv_i
 -
++                    mask[bi_i] = Masks[b_i, s_i, g_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i]]
                  for bi_i, d_i in T.Parallel(BI, D):
                      KV_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i]
                  for bi_i, d_i in T.Parallel(BI, D_tail):
@@ -804,16 +867,16 @@ index 2c8bf7fc..42f3ae02 100644
 -
                  for h_i, bi_i in T.Parallel(H_per_block, BI):
 -                    acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_s.dtype))
-+                    acc_s[h_i, bi_i] = 0
++                    acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], -T.infinity(acc_s.dtype), 0)
                  T.gemm(
                      Q_shared,
                      KV_shared,
-@@ -169,158 +164,21 @@ def sparse_mla_fwd(
+@@ -169,158 +170,22 @@ def sparse_mla_fwd(
      return main
  
  
 -def sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, return_p_sum: bool = False, d_v=512, block_I=64, num_stages=2, threads=256):
-+def sparse_mla_fwd_interface(q, kv, indices, d_v, sm_scale=None, return_p_sum: bool = False, block_I=64, num_stages=2, threads=256):
++def sparse_mla_fwd_interface(q, kv, indices, masks, d_v, sm_scale=None, return_p_sum: bool = False, block_I=64, num_stages=2, threads=256):
      is_casual = True
      assert return_p_sum == False, "This kernel file is for fwd only"
      assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous()
@@ -829,12 +892,14 @@ index 2c8bf7fc..42f3ae02 100644
      assert kv.shape[0] == batch
      _, _, _, topk = indices.shape
      assert indices.shape == (batch, seq_len, kv_group, topk)
++    assert masks.shape == (batch, seq_len, kv_group, seq_len_kv)
  
      kernel = sparse_mla_fwd(
 -        heads, dim, tail_dim, topk, kv_group, sm_scale, is_casual, block_I=block_I, num_stages=num_stages, threads=threads
 +        heads, d_v, tail_dim, topk, kv_group, sm_scale, is_casual, block_I=block_I, num_stages=num_stages, threads=threads
      )
-     out, lse = kernel(q, kv, indices)
+-    out, lse = kernel(q, kv, indices)
++    out, lse = kernel(q, kv, indices, masks)
      return out, lse
 -
 -
@@ -987,10 +1052,10 @@ index 7e664d11..99d2dbeb 100644
  
 diff --git a/examples/deepseek_v32/test.py b/examples/deepseek_v32/test.py
 new file mode 100644
-index 00000000..e9874a89
+index 00000000..04825728
 --- /dev/null
 +++ b/examples/deepseek_v32/test.py
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,181 @@
 +
 +import torch
 +import torch.distributed as dist
@@ -1128,9 +1193,19 @@ index 00000000..e9874a89
 +
 +    sparse_mask_tmp   = torch.chunk(attn_mask_full, cp_size * 2, dim=2)
 +    sparse_mask_local = torch.cat([sparse_mask_tmp[curr_rank], sparse_mask_tmp[mirror]], dim=2).contiguous()
++    random_mask = (torch.rand_like(sparse_mask_local, dtype=torch.float32) < 0.5).contiguous()
++    max_false = 32
++    scores = torch.rand_like(random_mask, dtype=torch.float32)
++    scores = scores.masked_fill(random_mask, float("inf"))
++    false_idx = scores.topk(k=max_false, dim=-1, largest=False).indices
++    final_mask = torch.ones_like(random_mask, dtype=torch.bool)
++    final_mask.scatter_(-1, false_idx, False)
++    random_mask = final_mask.contiguous()
++    sparse_mask_local = random_mask | sparse_mask_local
 +
 +    indices_tmp   = torch.chunk(indices_full, cp_size * 2, dim=2)
 +    indices_local = torch.cat([indices_tmp[curr_rank], indices_tmp[mirror]], dim=2).contiguous().expand(-1, kv_group, -1, -1).contiguous()
++    random_mask_local = random_mask.expand(-1, kv_group, -1, -1).contiguous()
 +
 +    sm_scale = (dim + tail_dim)**-0.5
 +    attention_dropout = 0
@@ -1150,7 +1225,7 @@ index 00000000..e9874a89
 +    k_local.grad = None
 +    v_local.grad = None
 +    kv_local.grad = None
-+    res2 = AttentionFuncionWithContextParallel.apply(q_local, kv_local, indices_local, dim, topk, attention_dropout, sm_scale, cp_pg)
++    res2 = AttentionFuncionWithContextParallel.apply(q_local, kv_local, v_local, indices_local, random_mask_local, dim, topk, attention_dropout, sm_scale, cp_pg)
 +    res2.backward(do)
 +    dq = q_local.grad
 +    dkv = kv_local.grad
@@ -1161,5 +1236,5 @@ index 00000000..e9874a89
 +
 +
 +# run this test: rm -rf /tmp/tilelang_cache_clean && CUDA_VISIBLE_DEVICES=4,5,6,7 TILELANG_CACHE_DIR=/tmp/tilelang_cache_clean torchrun --nproc_per_node=4 /root/tilelang/examples/deepseek_v32/test.py
-+test_kernel(32, 512, 512, 512 // 4, 64 // 4, 128, 128, 128, 4)
++test_kernel(32, 512, 512, 512 // 4, 64, 128, 128, 128, 4)
 \ No newline at end of file

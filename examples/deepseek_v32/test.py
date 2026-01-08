@@ -135,9 +135,19 @@ def test_kernel(
 
     sparse_mask_tmp   = torch.chunk(attn_mask_full, cp_size * 2, dim=2)
     sparse_mask_local = torch.cat([sparse_mask_tmp[curr_rank], sparse_mask_tmp[mirror]], dim=2).contiguous()
+    random_mask = (torch.rand_like(sparse_mask_local, dtype=torch.float32) < 0.5).contiguous()
+    max_false = 32
+    scores = torch.rand_like(random_mask, dtype=torch.float32)
+    scores = scores.masked_fill(random_mask, float("inf"))
+    false_idx = scores.topk(k=max_false, dim=-1, largest=False).indices
+    final_mask = torch.ones_like(random_mask, dtype=torch.bool)
+    final_mask.scatter_(-1, false_idx, False)
+    random_mask = final_mask.contiguous()
+    sparse_mask_local = random_mask | sparse_mask_local
 
     indices_tmp   = torch.chunk(indices_full, cp_size * 2, dim=2)
     indices_local = torch.cat([indices_tmp[curr_rank], indices_tmp[mirror]], dim=2).contiguous().expand(-1, kv_group, -1, -1).contiguous()
+    random_mask_local = random_mask.expand(-1, kv_group, -1, -1).contiguous()
 
     sm_scale = (dim + tail_dim)**-0.5
     attention_dropout = 0
@@ -157,7 +167,7 @@ def test_kernel(
     k_local.grad = None
     v_local.grad = None
     kv_local.grad = None
-    res2 = AttentionFuncionWithContextParallel.apply(q_local, kv_local, indices_local, dim, topk, attention_dropout, sm_scale, cp_pg)
+    res2 = AttentionFuncionWithContextParallel.apply(q_local, kv_local, v_local, indices_local, random_mask_local, dim, topk, attention_dropout, sm_scale, cp_pg)
     res2.backward(do)
     dq = q_local.grad
     dkv = kv_local.grad
@@ -168,4 +178,4 @@ def test_kernel(
 
 
 # run this test: rm -rf /tmp/tilelang_cache_clean && CUDA_VISIBLE_DEVICES=4,5,6,7 TILELANG_CACHE_DIR=/tmp/tilelang_cache_clean torchrun --nproc_per_node=4 /root/tilelang/examples/deepseek_v32/test.py
-test_kernel(32, 512, 512, 512 // 4, 64 // 4, 128, 128, 128, 4)
+test_kernel(32, 512, 512, 512 // 4, 64, 128, 128, 128, 4)
