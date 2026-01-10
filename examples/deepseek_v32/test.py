@@ -136,7 +136,7 @@ def test_kernel(
     sparse_mask_tmp   = torch.chunk(attn_mask_full, cp_size * 2, dim=2)
     sparse_mask_local = torch.cat([sparse_mask_tmp[curr_rank], sparse_mask_tmp[mirror]], dim=2).contiguous()
     random_mask = (torch.rand_like(sparse_mask_local, dtype=torch.float32) < 0.5).contiguous()
-    max_false = 128
+    max_false = 224
     scores = torch.rand_like(random_mask, dtype=torch.float32)
     scores = scores.masked_fill(random_mask, float("inf"))
     false_idx = scores.topk(k=max_false, dim=-1, largest=False).indices
