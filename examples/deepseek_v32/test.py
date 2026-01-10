@@ -90,7 +90,7 @@ def test_kernel(
     seq_len,
     seq_len_kv,
     dim,
-    tail_dim,
+    dim_v,
     topk,
     nheads,
     kv_group,
@@ -100,23 +100,23 @@ def test_kernel(
     cp_pg, curr_rank = create_cp_pg(cp_size=4)
 
     torch.manual_seed(42)
-    # q: [seq_len_shard, batch, nheads, dim + tail_dim]
-    # kv: [seq_len_kv_shard, batch, kv_group, dim + tail_dim]
-    #   k: [seq_len_kv_shard, batch, kv_group, dim + tail_dim]
-    #   v: [seq_len_kv_shard, batch, kv_group, dim]
+    # q: [seq_len_shard, batch, nheads, dim]
+    #   k: [seq_len_kv_shard, batch, kv_group, dim]
+    #   v: [seq_len_kv_shard, batch, kv_group, dim_v]
     # indices: [batch, kv_group, seq_len, topk]
-    q_full  = torch.randn((seq_len,    batch, nheads,   dim + tail_dim), device="cuda", dtype=torch.bfloat16)
-    kv_full = torch.randn((seq_len_kv, batch, kv_group, dim + tail_dim), device="cuda", dtype=torch.bfloat16)
+    q_full  = torch.randn((seq_len,    batch, nheads,   dim), device="cuda", dtype=torch.bfloat16)
+    k_full = torch.randn((seq_len_kv, batch, kv_group, dim), device="cuda", dtype=torch.bfloat16)
+    v_full = torch.randn((seq_len_kv, batch, kv_group, dim_v), device="cuda", dtype=torch.bfloat16)
 
     q_tmp  = torch.chunk(q_full,  cp_size * 2, dim=0)
-    kv_tmp = torch.chunk(kv_full, cp_size * 2, dim=0)
+    k_tmp = torch.chunk(k_full, cp_size * 2, dim=0)
+    v_tmp = torch.chunk(v_full, cp_size * 2, dim=0)
+
 
     mirror = cp_size * 2 - curr_rank - 1
     q_local  = torch.cat([q_tmp[curr_rank],  q_tmp[mirror]],  dim=0).contiguous().requires_grad_()
-    kv_local = torch.cat([kv_tmp[curr_rank], kv_tmp[mirror]], dim=0).contiguous().requires_grad_()
-    k_full, v_full = kv_full.clone().contiguous(), kv_full[..., :dim].clone().contiguous()
-    k_local = kv_local.detach().clone().contiguous().requires_grad_(True)
-    v_local = kv_local[..., :dim].detach().clone().contiguous().requires_grad_(True)
+    k_local = torch.cat([k_tmp[curr_rank], k_tmp[mirror]], dim=0).contiguous().requires_grad_()
+    v_local = torch.cat([v_tmp[curr_rank], v_tmp[mirror]], dim=0).contiguous().requires_grad_()
 
     # indices: long, no grad
     perm = torch.randperm(seq_len_kv, device="cuda")
@@ -136,7 +136,7 @@ def test_kernel(
     sparse_mask_tmp   = torch.chunk(attn_mask_full, cp_size * 2, dim=2)
     sparse_mask_local = torch.cat([sparse_mask_tmp[curr_rank], sparse_mask_tmp[mirror]], dim=2).contiguous()
     random_mask = (torch.rand_like(sparse_mask_local, dtype=torch.float32) < 0.5).contiguous()
-    max_false = 32
+    max_false = 128
     scores = torch.rand_like(random_mask, dtype=torch.float32)
     scores = scores.masked_fill(random_mask, float("inf"))
     false_idx = scores.topk(k=max_false, dim=-1, largest=False).indices
@@ -149,33 +149,36 @@ def test_kernel(
     indices_local = torch.cat([indices_tmp[curr_rank], indices_tmp[mirror]], dim=2).contiguous().expand(-1, kv_group, -1, -1).contiguous()
     random_mask_local = random_mask.expand(-1, kv_group, -1, -1).contiguous()
 
-    sm_scale = (dim + tail_dim)**-0.5
+    sm_scale = (dim)**-0.5
     attention_dropout = 0
 
-    do = torch.randn((seq_len//cp_size,  batch, nheads,  dim), device="cuda", dtype=torch.bfloat16).contiguous()
+    do = torch.randn((seq_len//cp_size,  batch, nheads,  dim_v), device="cuda", dtype=torch.bfloat16).contiguous()
 
     # [b, 1, sq, skv_global]
     q_local.grad = None
-    kv_local.grad = None
-    res1 = Ref.apply(q_local, kv_local, v_local, sparse_mask_local, attention_dropout, sm_scale, cp_pg, True)
+    k_local.grad = None
+    v_local.grad = None
+    res1 = Ref.apply(q_local, k_local, v_local, sparse_mask_local, attention_dropout, sm_scale, cp_pg, True)
     res1.backward(do)
     dq_ref = q_local.grad
-    dkv_ref = kv_local.grad
+    dk_ref = k_local.grad
+    dv_ref = v_local.grad
 
     # [batch, kv_group, seq_len, topk]
     q_local.grad = None
     k_local.grad = None
     v_local.grad = None
-    kv_local.grad = None
-    res2 = AttentionFuncionWithContextParallel.apply(q_local, kv_local, v_local, indices_local, random_mask_local, dim, topk, attention_dropout, sm_scale, cp_pg)
+    res2 = AttentionFuncionWithContextParallel.apply(q_local, k_local, v_local, indices_local, random_mask_local, attention_dropout, sm_scale, cp_pg)
     res2.backward(do)
     dq = q_local.grad
-    dkv = kv_local.grad
+    dk = k_local.grad
+    dv = v_local.grad
 
     # match the dq
     assert torch.allclose(dq_ref, dq, rtol=1e-1, atol=1e-1)
-    assert torch.allclose(dkv_ref, dkv, rtol=1e-1, atol=1e-1)
+    assert torch.allclose(dv_ref, dv, rtol=1e-1, atol=1e-1)
+    assert torch.allclose(res1, res2, rtol=1e-1, atol=1e-1)
 
 
 # run this test: rm -rf /tmp/tilelang_cache_clean && CUDA_VISIBLE_DEVICES=4,5,6,7 TILELANG_CACHE_DIR=/tmp/tilelang_cache_clean torchrun --nproc_per_node=4 /root/tilelang/examples/deepseek_v32/test.py
-test_kernel(32, 512, 512, 512 // 4, 64, 128, 128, 128, 4)
+test_kernel(32, 512, 512, 192, 128, 256, 128, 128, 4)

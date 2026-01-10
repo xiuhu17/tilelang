@@ -14,54 +14,48 @@ from utils import assert_tensors_similar
 )
 def sparse_mla_fwd(
     heads,
+    kv_groups,
     dim,
-    tail_dim,
-    topk,
-    kv_group=1,
-    sm_scale=None,
-    is_causal=True,
+    dim_v,
+    top_k, 
+    sm_scale,
     CP0=True,
     block_I=64,
     num_stages=2,
     threads=256,
 ):
-    assert dim == tilelang.math.next_power_of_2(dim), f"haven't check padding correctness yet, dim={dim}"
-    assert tail_dim == tilelang.math.next_power_of_2(tail_dim), f"haven't check padding correctness yet, dim={tail_dim}"
-    assert is_causal == True, "non-casual is not supported"
-    assert topk % block_I == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
-    if sm_scale is None:
-        sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
-    else:
-        sm_scale = sm_scale * 1.44269504  # log2(e)
+
+    sm_scale = sm_scale * 1.44269504  # log2(e)
 
     batch = T.dynamic("batch")
     seq_len = T.dynamic("seq_len")
     seq_len_kv = T.dynamic("seq_len_kv")
 
-    head_kv = heads // kv_group
-    q_shape = [batch, seq_len, heads, dim + tail_dim]
-    kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
-    o_shape = [batch, seq_len, heads, dim]
-    indices_shape = [batch, seq_len, kv_group, topk]
+    head_kv = heads // kv_groups
+    q_shape = [batch, seq_len, heads, dim]
+    k_shape = [batch, seq_len_kv, kv_groups, dim]
+    v_shape = [batch, seq_len_kv, kv_groups, dim_v]
+    o_shape = [batch, seq_len, heads, dim_v]
+    indices_shape = [batch, seq_len, kv_groups, top_k]
+    masks_shape = [batch, seq_len, kv_groups, seq_len_kv]
     lse_shape = [batch, seq_len, heads]
-    masks_shape = [batch, seq_len, kv_group, seq_len_kv]
 
     masks_dtype = T.bool
     indices_dtype = T.int32
     dtype = T.bfloat16
     accum_dtype = T.float32
 
-    G = kv_group
+    G = kv_groups
     H = head_kv
     padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
     if padded_H != H:
-        assert kv_group == 1, (
+        assert kv_groups == 1, (
             "here we solve the H padding automatically, other wise you should handle Q copy and Output copy with your mask (when kv_group == 1, use g_i * padded_H:(g_i+1) * padded_H would be handled automatically)"
         )
     BI = block_I
-    NI = tilelang.cdiv(topk, block_I)
+    NI = tilelang.cdiv(top_k, block_I)
     D = dim
-    D_tail = tail_dim
+    D_V = dim_v
 
     if head_kv > 64:
         assert head_kv % 64 == 0, "head_kv should be a multiple of 64"
@@ -74,26 +68,26 @@ def sparse_mla_fwd(
     @T.prim_func
     def main(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
-        KV: T.Tensor(kv_shape, dtype),  # type: ignore
+        K: T.Tensor(k_shape, dtype),  # type: ignore
+        V: T.Tensor(v_shape, dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
         Masks: T.Tensor(masks_shape, masks_dtype), # type: ignore
         Output: T.Tensor(o_shape, dtype),  # type: ignore
         Lse: T.Tensor(lse_shape, accum_dtype),  # type: ignore
     ):
-        with T.Kernel(seq_len * REPLICATE_H, batch, kv_group, threads=threads) as (
+        with T.Kernel(seq_len * REPLICATE_H, batch, kv_groups, threads=threads) as (
             bx,
             by,
             bz,
         ):
             Q_shared = T.alloc_shared([H_per_block, D], dtype)
-            Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
-            KV_shared = T.alloc_shared([BI, D], dtype)
-            K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
-            O_shared = T.alloc_shared([H_per_block, D], dtype)
+            K_shared = T.alloc_shared([BI, D], dtype)
+            V_shared = T.alloc_shared([BI, D_V], dtype)
+            O_shared = T.alloc_shared([H_per_block, D_V], dtype)
             Lse_shared = T.alloc_shared([H_per_block], accum_dtype)
             mask = T.alloc_fragment([BI], "bool")
 
-            acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
+            acc_o = T.alloc_fragment([H_per_block, D_V], accum_dtype)
             acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
             S_shared = T.alloc_shared([H_per_block, BI], dtype)
             sumexp = T.alloc_fragment([H_per_block], accum_dtype)
@@ -114,27 +108,19 @@ def sparse_mla_fwd(
             H1 = H0 + H_per_block
 
             T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
-            T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
 
             for i_i in T.Pipelined(NI, num_stages=num_stages):
                 for bi_i in T.Parallel(BI):
                     mask[bi_i] = Masks[b_i, s_i, g_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i]]
                 for bi_i, d_i in T.Parallel(BI, D):
-                    KV_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i]
-                for bi_i, d_i in T.Parallel(BI, D_tail):
-                    K_tail_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i]
+                    K_shared[bi_i, d_i] = K[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i]
+                for bi_i, d_i in T.Parallel(BI, D_V):
+                    V_shared[bi_i, d_i] = V[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i]
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
                     acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], -T.infinity(acc_s.dtype), 0)
                 T.gemm(
                     Q_shared,
-                    KV_shared,
-                    acc_s,
-                    transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullRow,
-                )
-                T.gemm(
-                    Q_tail_shared,
-                    K_tail_shared,
+                    K_shared,
                     acc_s,
                     transpose_B=True,
                     policy=T.GemmWarpPolicy.FullRow,
@@ -146,18 +132,19 @@ def sparse_mla_fwd(
                 for h_i in T.Parallel(H_per_block):
                     alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
+                    # scale the new score
                     acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
                 T.reduce_sum(acc_s, sumexp_i, dim=1)  # is this a accumulate operator?
                 for h_i in T.Parallel(H_per_block):
                     sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
-                for h_i, d_i in T.Parallel(H_per_block, D):
+                for h_i, d_i in T.Parallel(H_per_block, D_V):
                     acc_o[h_i, d_i] = acc_o[h_i, d_i] * alpha[h_i]
 
                 T.copy(acc_s, S_shared)
-                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(S_shared, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
             # Rescale
-            for h_i, d_i in T.Parallel(H_per_block, D):
+            for h_i, d_i in T.Parallel(H_per_block, D_V):
                 acc_o[h_i, d_i] /= sumexp[h_i]
             for h_i in T.Parallel(H_per_block):
                 sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
@@ -170,22 +157,15 @@ def sparse_mla_fwd(
     return main
 
 
-def sparse_mla_fwd_interface(q, kv, indices, masks, d_v, sm_scale=None, return_p_sum: bool = False, block_I=64, num_stages=2, threads=256):
-    is_casual = True
-    assert return_p_sum == False, "This kernel file is for fwd only"
-    assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous()
-    batch, seq_len, heads, dim_plus_tail_dim = q.shape
-    _, seq_len_kv, kv_group, _ = kv.shape
-
-    assert kv.shape[-1] == dim_plus_tail_dim
-    tail_dim = dim_plus_tail_dim - d_v
-    assert kv.shape[0] == batch
-    _, _, _, topk = indices.shape
-    assert indices.shape == (batch, seq_len, kv_group, topk)
-    assert masks.shape == (batch, seq_len, kv_group, seq_len_kv)
+def sparse_mla_fwd_interface(q, k, v, indices, masks, sm_scale, block_I=64, num_stages=2, threads=256):
+    assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous() and indices.is_contiguous() and masks.is_contiguous()
+    b, s, heads, dim = q.shape
+    _, skv, kv_groups, dim_v = v.shape
+    top_k = indices.shape[-1]
 
     kernel = sparse_mla_fwd(
-        heads, d_v, tail_dim, topk, kv_group, sm_scale, is_casual, block_I=block_I, num_stages=num_stages, threads=threads
+        heads, kv_groups, dim, dim_v, top_k, sm_scale, block_I=block_I, num_stages=num_stages, threads=threads
     )
-    out, lse = kernel(q, kv, indices, masks)
+    out, lse = kernel(q, k, v, indices, masks)
+
     return out, lse
